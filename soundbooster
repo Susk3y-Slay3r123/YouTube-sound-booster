@@ -1,0 +1,135 @@
+// ==UserScript==
+// @name         Universal Volume Booster with Extreme Gain (1 Billion×)
+// @namespace    http://tampermonkey.net/
+// @version      1.7
+// @description  Adds a slider to boost HTML5 audio/video volume (up to 1 billion×) on any website.
+// @match        *://*/*
+// @grant        none
+// @run-at       document-end
+// ==/UserScript==
+
+(function() {
+    'use strict';
+
+    const MAX_GAIN = 1000000000.0;  // Set the max multiplier to 1 billion (1B×)
+    let currentGain = 1.0;
+
+    // Create UI panel
+    function createControlPanel() {
+        const panel = document.createElement('div');
+        panel.style.position = 'fixed';
+        panel.style.bottom = '10px';
+        panel.style.right = '10px';
+        panel.style.padding = '8px 12px';
+        panel.style.background = 'rgba(0,0,0,0.7)';
+        panel.style.color = '#fff';
+        panel.style.fontFamily = 'sans-serif';
+        panel.style.fontSize = '14px';
+        panel.style.zIndex = 1000000;
+        panel.style.borderRadius = '4px';
+        panel.style.display = 'flex';
+        panel.style.alignItems = 'center';
+
+        const label = document.createElement('span');
+        label.textContent = 'Boost: ';
+        label.style.marginRight = '6px';
+
+        const slider = document.createElement('input');
+        slider.type = 'range';
+        slider.min = '1';
+        slider.max = String(MAX_GAIN);
+        slider.step = '0.1';
+        slider.value = String(currentGain);
+        slider.style.verticalAlign = 'middle';
+
+        const display = document.createElement('span');
+        display.textContent = currentGain.toFixed(1) + '×';
+        display.style.marginLeft = '8px';
+
+        slider.addEventListener('input', () => {
+            currentGain = parseFloat(slider.value);
+            display.textContent = currentGain.toFixed(1) + '×';
+            updateAllGainNodes(currentGain);
+        });
+
+        panel.appendChild(label);
+        panel.appendChild(slider);
+        panel.appendChild(display);
+        document.body.appendChild(panel);
+
+        return slider;
+    }
+
+    // Attach booster to a media element
+    function attachBooster(mediaEl) {
+        if (mediaEl._volumeBoosterAttached) {
+            // Already attached; update gain node if exists
+            if (mediaEl._gainNode) {
+                mediaEl._gainNode.gain.value = currentGain;
+            }
+            return;
+        }
+        try {
+            const AudioContext = window.AudioContext || window.webkitAudioContext;
+            const context = new AudioContext();
+            const source = context.createMediaElementSource(mediaEl);
+            const gainNode = context.createGain();
+            gainNode.gain.value = currentGain;
+            source.connect(gainNode);
+            gainNode.connect(context.destination);
+
+            mediaEl._volumeBoosterAttached = true;
+            mediaEl._gainNode = gainNode;
+
+            console.log('Volume booster attached to', mediaEl, 'gain:', currentGain);
+        } catch (err) {
+            console.warn('Volume booster failed for element', mediaEl, err);
+        }
+    }
+
+    // Update all existing gain nodes
+    function updateAllGainNodes(gainValue) {
+        const mediaEls = document.querySelectorAll('audio, video');
+        mediaEls.forEach(el => {
+            if (el._volumeBoosterAttached && el._gainNode) {
+                el._gainNode.gain.value = gainValue;
+            }
+        });
+    }
+
+    // Find and attach boosters to any new media elements
+    function attachToAll() {
+        const mediaEls = document.querySelectorAll('audio, video');
+        mediaEls.forEach(el => attachBooster(el));
+    }
+
+    function init() {
+        createControlPanel();
+        attachToAll();
+
+        const observer = new MutationObserver(mutations => {
+            mutations.forEach(m => {
+                m.addedNodes.forEach(node => {
+                    if (node.nodeType === 1) {
+                        if (node.tagName === 'AUDIO' || node.tagName === 'VIDEO') {
+                            attachBooster(node);
+                        } else {
+                            // also check inside
+                            const nested = node.querySelectorAll && node.querySelectorAll('audio, video');
+                            if (nested) {
+                                nested.forEach(el => attachBooster(el));
+                            }
+                        }
+                    }
+                });
+            });
+        });
+        observer.observe(document.body || document.documentElement, { childList: true, subtree: true });
+    }
+
+    if (document.readyState === 'loading') {
+        document.addEventListener('DOMContentLoaded', init);
+    } else {
+        init();
+    }
+})();
