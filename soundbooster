@@ -1,135 +1,359 @@
 // ==UserScript==
-// @name         Universal Volume Booster with Extreme Gain (1 Billion×)
-// @namespace    http://tampermonkey.net/
-// @version      1.7
-// @description  Adds a slider to boost HTML5 audio/video volume (up to 1 billion×) on any website.
+// @name         Extreme Universal Sound Booster (compact + emergency mute + / toggle)
+// @namespace    https://example.local/soundbooster
+// @version      1.0
+// @description  Compact universal audio booster. Slider starts at 0 (silent). Extremely steep logarithmic ramp up to 1e90. Tiny UI: label (draggable) + slider + numeric input + emergency mute (×). Press '/' to hide/show. Expect heavy clipping/distortion at high gains.
 // @match        *://*/*
 // @grant        none
-// @run-at       document-end
+// @run-at       document-start
 // ==/UserScript==
 
-(function() {
-    'use strict';
+(function () {
+  'use strict';
 
-    const MAX_GAIN = 1000000000.0;  // Set the max multiplier to 1 billion (1B×)
-    let currentGain = 1.0;
+  // --- Config ---
+  const START_MULTIPLIER = 0;        // start silent
+  const SLIDER_MIN = 0;
+  const SLIDER_MAX = 100;
+  const MAX_EXP = 90;                // slider maps to 10^(t * MAX_EXP) for t in (0..1]
+  // multiplier = 0 when slider==0, else multiplier = 10^( (slider/SLIDER_MAX) * MAX_EXP )
+  // This gives an extremely steep ramp; halfway (~50) => 10^(45).
+  // --- end config ---
 
-    // Create UI panel
-    function createControlPanel() {
-        const panel = document.createElement('div');
-        panel.style.position = 'fixed';
-        panel.style.bottom = '10px';
-        panel.style.right = '10px';
-        panel.style.padding = '8px 12px';
-        panel.style.background = 'rgba(0,0,0,0.7)';
-        panel.style.color = '#fff';
-        panel.style.fontFamily = 'sans-serif';
-        panel.style.fontSize = '14px';
-        panel.style.zIndex = 1000000;
-        panel.style.borderRadius = '4px';
-        panel.style.display = 'flex';
-        panel.style.alignItems = 'center';
+  if (window.__extremeUSB_init) return;
+  window.__extremeUSB_init = true;
 
-        const label = document.createElement('span');
-        label.textContent = 'Boost: ';
-        label.style.marginRight = '6px';
+  // global state
+  window.__extremeUSB = {
+    ctx: null,
+    nodes: new WeakMap(), // mediaElement -> { source, gain, method }
+    intendedMultiplier: START_MULTIPLIER,
+  };
 
-        const slider = document.createElement('input');
-        slider.type = 'range';
-        slider.min = '1';
-        slider.max = String(MAX_GAIN);
-        slider.step = '0.1';
-        slider.value = String(currentGain);
-        slider.style.verticalAlign = 'middle';
-
-        const display = document.createElement('span');
-        display.textContent = currentGain.toFixed(1) + '×';
-        display.style.marginLeft = '8px';
-
-        slider.addEventListener('input', () => {
-            currentGain = parseFloat(slider.value);
-            display.textContent = currentGain.toFixed(1) + '×';
-            updateAllGainNodes(currentGain);
-        });
-
-        panel.appendChild(label);
-        panel.appendChild(slider);
-        panel.appendChild(display);
-        document.body.appendChild(panel);
-
-        return slider;
+  // Create AudioContext lazily
+  function ensureAudioContext() {
+    if (window.__extremeUSB.ctx) return window.__extremeUSB.ctx;
+    try {
+      const C = window.AudioContext || window.webkitAudioContext;
+      window.__extremeUSB.ctx = new C();
+    } catch (e) {
+      console.warn('ExtremeUSB: AudioContext creation failed', e);
+      window.__extremeUSB.ctx = null;
     }
+    return window.__extremeUSB.ctx;
+  }
 
-    // Attach booster to a media element
-    function attachBooster(mediaEl) {
-        if (mediaEl._volumeBoosterAttached) {
-            // Already attached; update gain node if exists
-            if (mediaEl._gainNode) {
-                mediaEl._gainNode.gain.value = currentGain;
+  // Compute multiplier from slider position (very steep/logarithmic)
+  function sliderToMultiplier(v) {
+    v = Number(v);
+    if (!isFinite(v) || v <= 0) return 0;
+    const t = Math.max(SLIDER_MIN, Math.min(SLIDER_MAX, v)) / SLIDER_MAX; // 0..1
+    const exp = t * MAX_EXP;
+    // multiplier = 10^exp
+    const m = Math.pow(10, exp);
+    return m;
+  }
+  function multiplierToSlider(m) {
+    m = Number(m);
+    if (!isFinite(m) || m <= 0) return 0;
+    const exp = Math.log10(m);
+    const t = exp / MAX_EXP;
+    const v = Math.round(Math.max(SLIDER_MIN, Math.min(SLIDER_MAX, t * SLIDER_MAX)));
+    return v;
+  }
+
+  // Hook a single media element
+  function hookElement(el) {
+    if (!el || !(el instanceof HTMLMediaElement)) return;
+    if (window.__extremeUSB.nodes.has(el)) return;
+
+    const ctx = ensureAudioContext();
+    if (ctx) {
+      try {
+        // createMediaElementSource may throw when element is cross-origin or already connected
+        const source = ctx.createMediaElementSource(el);
+        const gain = ctx.createGain();
+        // initial gain (may be 0)
+        gain.gain.value = window.__extremeUSB.intendedMultiplier || START_MULTIPLIER;
+        source.connect(gain);
+        gain.connect(ctx.destination);
+        try { el.muted = false; } catch (e) {}
+        window.__extremeUSB.nodes.set(el, { source, gain, method: 'webaudio' });
+        return;
+      } catch (e) {
+        // fallback to DOM volume
+      }
+    }
+    // DOM fallback: set volume to max (clamped by browser)
+    try {
+      el.volume = 1.0;
+      window.__extremeUSB.nodes.set(el, { method: 'dom' });
+    } catch (e) {
+      // ignore
+    }
+  }
+
+  // Hook all current media elements
+  function hookAll() {
+    try {
+      document.querySelectorAll('audio,video').forEach(hookElement);
+    } catch (e) {}
+  }
+
+  // Apply multiplier to all hooked elements
+  function setMultiplier(mult) {
+    // allow 0 to mute
+    if (!isFinite(mult) || mult < 0) return;
+    window.__extremeUSB.intendedMultiplier = mult;
+
+    // Ensure audio context exists if possible
+    ensureAudioContext();
+
+    // Iterate current media elements
+    try {
+      document.querySelectorAll('audio,video').forEach(el => {
+        const rec = window.__extremeUSB.nodes.get(el);
+        if (rec && rec.method === 'webaudio' && rec.gain) {
+          try {
+            // set linear gain; huge values may clip or be clamped internally
+            rec.gain.gain.value = mult;
+          } catch (e) {
+            console.warn('ExtremeUSB: failed to set gain', e);
+          }
+        } else if (rec && rec.method === 'dom') {
+          try { el.volume = 1.0; } catch (e) {}
+        } else {
+          // not hooked yet: try to hook then set
+          try {
+            hookElement(el);
+            const nr = window.__extremeUSB.nodes.get(el);
+            if (nr && nr.method === 'webaudio' && nr.gain) {
+              try { nr.gain.gain.value = mult; } catch (e) {}
+            } else if (nr && nr.method === 'dom') {
+              try { el.volume = 1.0; } catch (e) {}
             }
-            return;
+          } catch (e) {}
+        }
+      });
+    } catch (e) {}
+  }
+
+  // Resume AudioContext on user interaction
+  function resumeIfNeeded() {
+    const ctx = ensureAudioContext();
+    if (!ctx) return;
+    if (ctx.state === 'suspended') {
+      ctx.resume().catch(() => {});
+    }
+  }
+
+  // MutationObserver to catch new media elements
+  const mo = new MutationObserver((mutations) => {
+    for (const m of mutations) {
+      if (!m.addedNodes) continue;
+      m.addedNodes.forEach(node => {
+        if (!(node instanceof Element)) return;
+        if (node.matches && (node.matches('audio') || node.matches('video'))) {
+          hookElement(node);
+          setMultiplier(window.__extremeUSB.intendedMultiplier);
         }
         try {
-            const AudioContext = window.AudioContext || window.webkitAudioContext;
-            const context = new AudioContext();
-            const source = context.createMediaElementSource(mediaEl);
-            const gainNode = context.createGain();
-            gainNode.gain.value = currentGain;
-            source.connect(gainNode);
-            gainNode.connect(context.destination);
+          node.querySelectorAll && node.querySelectorAll('audio,video').forEach(el => {
+            hookElement(el);
+            setMultiplier(window.__extremeUSB.intendedMultiplier);
+          });
+        } catch (e) {}
+      });
+    }
+  });
 
-            mediaEl._volumeBoosterAttached = true;
-            mediaEl._gainNode = gainNode;
+  // Patch play to hook elements created/delayed by libs
+  (function patchPlay() {
+    const proto = HTMLMediaElement.prototype;
+    if (proto.__extreme_play_patched) return;
+    proto.__extreme_play_patched = true;
+    const orig = proto.play;
+    proto.play = function (...args) {
+      try { hookElement(this); setMultiplier(window.__extremeUSB.intendedMultiplier); } catch (e) {}
+      return orig.apply(this, args);
+    };
+  })();
 
-            console.log('Volume booster attached to', mediaEl, 'gain:', currentGain);
-        } catch (err) {
-            console.warn('Volume booster failed for element', mediaEl, err);
-        }
+  // Build compact UI: draggable label, slider, input, tiny mute button
+  function createUI() {
+    const root = document.createElement('div');
+    root.id = '__extreme_usb_ui';
+    root.style.position = 'fixed';
+    root.style.right = '12px';
+    root.style.top = '12px';
+    root.style.zIndex = 2147483647;
+    root.style.fontFamily = 'Arial, Helvetica, sans-serif';
+    root.style.fontSize = '12px';
+    root.style.background = 'rgba(255,255,255,0.95)';
+    root.style.border = '1px solid rgba(0,0,0,0.08)';
+    root.style.borderRadius = '8px';
+    root.style.padding = '6px';
+    root.style.display = 'flex';
+    root.style.gap = '6px';
+    root.style.alignItems = 'center';
+    root.style.boxShadow = '0 6px 18px rgba(0,0,0,0.12)';
+    root.style.minWidth = '240px';
+    root.style.userSelect = 'none';
+
+    // label (draggable)
+    const label = document.createElement('div');
+    label.textContent = 'Boost';
+    label.style.fontWeight = '700';
+    label.style.cursor = 'grab';
+    label.style.marginRight = '6px';
+    root.appendChild(label);
+
+    // slider
+    const slider = document.createElement('input');
+    slider.type = 'range';
+    slider.min = SLIDER_MIN;
+    slider.max = SLIDER_MAX;
+    slider.value = multiplierToSlider(START_MULTIPLIER);
+    slider.style.width = '140px';
+    slider.style.height = '18px';
+    root.appendChild(slider);
+
+    // input
+    const input = document.createElement('input');
+    input.type = 'text';
+    input.value = String(START_MULTIPLIER);
+    input.style.width = '120px';
+    input.style.padding = '4px 6px';
+    input.style.border = '1px solid rgba(0,0,0,0.06)';
+    input.style.borderRadius = '6px';
+    input.title = 'Type multiplier (e.g., 1e45) and press Enter. 0 = mute';
+
+    root.appendChild(input);
+
+    // tiny emergency mute button (×)
+    const muteBtn = document.createElement('button');
+    muteBtn.textContent = '×';
+    muteBtn.title = 'Emergency mute (reset slider to 0)';
+    muteBtn.style.marginLeft = '6px';
+    muteBtn.style.width = '22px';
+    muteBtn.style.height = '22px';
+    muteBtn.style.padding = '0';
+    muteBtn.style.border = '1px solid rgba(0,0,0,0.08)';
+    muteBtn.style.borderRadius = '6px';
+    muteBtn.style.background = '#fff';
+    muteBtn.style.cursor = 'pointer';
+    root.appendChild(muteBtn);
+
+    // draggable behavior
+    (function makeDraggable(node, handle) {
+      let dragging = false, sx = 0, sy = 0, ox = 0, oy = 0;
+      handle.addEventListener('pointerdown', (e) => {
+        dragging = true;
+        sx = e.clientX; sy = e.clientY;
+        const rect = node.getBoundingClientRect();
+        ox = rect.left; oy = rect.top;
+        handle.setPointerCapture(e.pointerId);
+      });
+      document.addEventListener('pointermove', (e) => {
+        if (!dragging) return;
+        const dx = e.clientX - sx;
+        const dy = e.clientY - sy;
+        node.style.left = (ox + dx) + 'px';
+        node.style.top = (oy + dy) + 'px';
+        node.style.right = 'auto';
+      });
+      document.addEventListener('pointerup', () => { dragging = false; });
+    })(root, label);
+
+    // slider interactions
+    let lastValidMultiplier = START_MULTIPLIER;
+    slider.addEventListener('input', (e) => {
+      const m = sliderToMultiplier(e.target.value);
+      // reflect in input (compact representation)
+      input.value = (m === 0) ? '0' : Number(m.toExponential(6));
+      resumeIfNeeded();
+      setMultiplier(m);
+      lastValidMultiplier = m;
+    });
+
+    // input interactions
+    input.addEventListener('keydown', (ev) => {
+      if (ev.key === 'Enter') applyInput();
+    });
+    input.addEventListener('blur', applyInput);
+
+    function applyInput() {
+      let text = input.value.trim();
+      if (!text) { input.value = String(lastValidMultiplier); return; }
+      let m = Number(text);
+      if (!isFinite(m)) {
+        try { m = eval(text); } catch (e) { m = NaN; }
+      }
+      if (!isFinite(m) || m < 0) {
+        input.value = String(lastValidMultiplier);
+        return;
+      }
+      lastValidMultiplier = m;
+      // update slider (cap to slider range for display)
+      slider.value = multiplierToSlider(m);
+      resumeIfNeeded();
+      setMultiplier(m);
     }
 
-    // Update all existing gain nodes
-    function updateAllGainNodes(gainValue) {
-        const mediaEls = document.querySelectorAll('audio, video');
-        mediaEls.forEach(el => {
-            if (el._volumeBoosterAttached && el._gainNode) {
-                el._gainNode.gain.value = gainValue;
-            }
-        });
-    }
+    // emergency mute button
+    muteBtn.addEventListener('click', () => {
+      // immediate mute: set multiplier 0 and slider/input reflect it
+      slider.value = SLIDER_MIN;
+      input.value = '0';
+      lastValidMultiplier = 0;
+      setMultiplier(0);
+    });
 
-    // Find and attach boosters to any new media elements
-    function attachToAll() {
-        const mediaEls = document.querySelectorAll('audio, video');
-        mediaEls.forEach(el => attachBooster(el));
-    }
+    // append
+    document.documentElement.appendChild(root);
 
-    function init() {
-        createControlPanel();
-        attachToAll();
+    return { root, slider, input, muteBtn };
+  }
 
-        const observer = new MutationObserver(mutations => {
-            mutations.forEach(m => {
-                m.addedNodes.forEach(node => {
-                    if (node.nodeType === 1) {
-                        if (node.tagName === 'AUDIO' || node.tagName === 'VIDEO') {
-                            attachBooster(node);
-                        } else {
-                            // also check inside
-                            const nested = node.querySelectorAll && node.querySelectorAll('audio, video');
-                            if (nested) {
-                                nested.forEach(el => attachBooster(el));
-                            }
-                        }
-                    }
-                });
-            });
-        });
-        observer.observe(document.body || document.documentElement, { childList: true, subtree: true });
-    }
+  // create UI when DOM available
+  function whenBody(fn) {
+    if (document.body) return fn();
+    new MutationObserver((mut, obs) => {
+      if (document.body) { obs.disconnect(); fn(); }
+    }).observe(document.documentElement, { childList: true, subtree: true });
+  }
 
-    if (document.readyState === 'loading') {
-        document.addEventListener('DOMContentLoaded', init);
-    } else {
-        init();
-    }
+  whenBody(() => {
+    const ui = createUI();
+
+    // initial hook
+    setTimeout(() => {
+      hookAll();
+      setMultiplier(START_MULTIPLIER);
+    }, 150);
+
+    // observe DOM
+    mo.observe(document.documentElement, { childList: true, subtree: true });
+
+    // toggle UI with '/' key (unless typing in input)
+    window.addEventListener('keydown', (ev) => {
+      if (ev.key === '/' && !ev.ctrlKey && !ev.metaKey && !ev.altKey) {
+        // don't toggle when focus is input
+        const active = document.activeElement;
+        if (active === ui.input) return;
+        ev.preventDefault();
+        ui.root.style.display = (ui.root.style.display === 'none') ? 'flex' : 'none';
+      }
+    });
+
+    // resume context on pointer down to slider/input
+    ui.slider.addEventListener('pointerdown', resumeIfNeeded);
+    ui.input.addEventListener('pointerdown', resumeIfNeeded);
+
+    // cleanup
+    window.addEventListener('beforeunload', () => {
+      try { if (window.__extremeUSB.ctx && window.__extremeUSB.ctx.close) window.__extremeUSB.ctx.close(); } catch (e) {}
+    });
+  });
+
 })();
